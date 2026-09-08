@@ -1,0 +1,90 @@
+# The launcher: a long-lived pod that the tests exec `mpirun` inside.
+#
+# mpirun has to run *in the cluster*, not beside it. The HNP is not a
+# client that pokes the API and walks away - it is one end of a live
+# out-of-band connection that every prted has to dial back to before the
+# DVM is up, and for filem/rsync it also runs the rsync daemon those same
+# prteds pull from. So it needs an address the daemon pods can reach and
+# ports they can open, which is exactly what a pod on the cluster network
+# gets and what a container merely attached to the same docker bridge does
+# not reliably get.
+#
+# hostNetwork: true for the same reason the daemon pods use it: it puts the
+# HNP on the node network, the same flat address space the daemons land in,
+# so there is no pod-CIDR asymmetry to reason about in either direction.
+# The launcher is pinned to the control-plane node, which is deliberately
+# *not* one of the nodes daemons are launched onto, so the HNP's hostname
+# never collides with a daemon's.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mpi-launcher
+---
+# plm/k8s shells out to kubectl, so the permissions it needs are just the
+# ones its own apply and its label-selector cleanup use. Jobs because that
+# is what the templates create; pods because cleanup deletes both, and
+# because a template could create pods directly.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mpi-launcher
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mpi-launcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mpi-launcher
+subjects:
+  - kind: ServiceAccount
+    name: mpi-launcher
+    namespace: default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mpi-launcher
+  labels:
+    app: mpi-launcher
+spec:
+  serviceAccountName: mpi-launcher
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: launcher
+      image: job-runner:latest
+      imagePullPolicy: IfNotPresent
+      # The tests kubectl-cp their fixtures into /work and then exec
+      # mpirun here; the pod itself just has to stay up.
+      command: ["/bin/sh", "-c"]
+      args: ["mkdir -p /work && exec sleep infinity"]
+      workingDir: /work
+      env:
+        # Select plm/k8s for everything launched from this pod. The
+        # component's own priority is deliberately below plm/ssh's, so it
+        # is never entered by accident on a machine that happens to have
+        # both - but in a pod whose whole purpose is launching into the
+        # cluster there is no accident to guard against, and setting it
+        # here is what lets "mpirun --host a,b ..." work as typed instead
+        # of needing "--prtemca plm k8s" every time. (PRRTE reads
+        # PRTE_MCA_<name> and "--prtemca <name>" interchangeably.)
+        - name: PRTE_MCA_plm
+          value: k8s

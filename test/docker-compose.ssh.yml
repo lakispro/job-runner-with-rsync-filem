@@ -1,0 +1,27 @@
+# Three containers on one network: one that runs mpirun and two that only
+# run sshd and wait to be launched into. See run-filem-ssh.sh.
+services:
+  head:
+    build:
+      context: .
+      dockerfile: Dockerfile.ssh
+      args:
+        IMAGE: ${IMAGE:-job-runner:latest}
+    image: job-runner-ssh:latest
+    hostname: head
+    volumes:
+      - ./fixtures:/work:ro
+    networks: [mpi]
+  worker1:
+    image: job-runner-ssh:latest
+    hostname: worker1
+    depends_on: [head]
+    networks: [mpi]
+  worker2:
+    image: job-runner-ssh:latest
+    hostname: worker2
+    depends_on: [head]
+    networks: [mpi]
+
+networks:
+  mpi:

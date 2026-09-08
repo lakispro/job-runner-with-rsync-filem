@@ -1,0 +1,39 @@
+# A thin sshd layer over the image under test, used by run-filem-ssh.sh to
+# exercise filem/rsync with plm/ssh instead of plm/k8s.
+#
+# The point of that test is separation: filem/rsync does not know or care
+# which PLM started the daemons - it moves files between the HNP and the
+# prteds over their own TCP path - and running it under ssh proves that,
+# as well as giving a way to debug pre-positioning without a cluster in
+# the picture.
+#
+# The host key and login key are generated *here*, in the image, so every
+# container started from it shares them and can ssh to any other without
+# provisioning. That is fine for a throwaway test rig on a private docker
+# network and would be inexcusable anywhere else.
+ARG IMAGE=job-runner:latest
+FROM ${IMAGE}
+
+RUN apt-get update >/dev/null && apt-get install -y --no-install-recommends \
+        openssh-server >/dev/null \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd /root/.ssh \
+    && chmod 700 /root/.ssh
+
+RUN ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 \
+    && cp /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys \
+    && chmod 600 /root/.ssh/authorized_keys \
+    && printf 'StrictHostKeyChecking no\nUserKnownHostsFile /dev/null\nLogLevel ERROR\n' \
+        > /root/.ssh/config \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' \
+        /etc/ssh/sshd_config
+
+# sshd does not inherit the image's ENV, and "ssh host prted" is exactly
+# how plm/ssh starts a daemon - so without this the remote daemon dies
+# with "prted: command not found". bash sources ~/.bashrc when its stdin
+# is a network connection, which is the hook that works for a
+# non-interactive remote command; the line goes first because the stock
+# .bashrc may return early.
+RUN sed -i '1i export PATH=/opt/ompi/bin:/opt/prte/bin:/opt/pmix/bin:$PATH' /root/.bashrc
+
+CMD ["/usr/sbin/sshd", "-D", "-e"]

@@ -1,0 +1,63 @@
+# Alternative plm/k8s template: one Job per node, pinned with nodeName,
+# wrapped in a single "kind: List" so it is still one rendered document
+# and one "kubectl apply".
+#
+# Use this instead of the default single-job template when a daemon has to
+# land on a *specific* node rather than merely on one of the allocated
+# ones - the case the Indexed-Job default cannot express, since Kubernetes
+# has no way to bind index i of a Job to node i. Here each object is
+# rendered inside the node section, so it gets that node's own name and
+# vpid and - crucially - a complete env block including ess_base_vpid,
+# which means the container command can be a bare `prted` with no index
+# arithmetic. (The renderer does not parse YAML, so it would substitute
+# tags inside these comments too; that is why the prose names them
+# instead of writing them out.)
+#
+# The trade-off is that "kind: List" is a client-side construct: kubectl
+# expands it and the API server stores N Jobs, so `kubectl get job` shows
+# N objects. Shutdown cleanup handles that fine (it deletes by label), but
+# if you want a single object in etcd, template a JobSet / LeaderWorkerSet
+# / Volcano PodGroup here instead - the node list is in scope either way.
+#
+#   prte --prtemca plm k8s \
+#        --prtemca plm_k8s_template $PWD/templates/list-of-jobs.yaml.tmpl ...
+apiVersion: v1
+kind: List
+items:
+  {{#nodes}}
+  - apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: {{name}}-{{rank}}
+      labels:
+        prrte.kubepmix.dev/managed-by: plm-k8s
+        prrte.kubepmix.dev/dvm: "{{name}}"
+        prrte.kubepmix.dev/rank: "{{rank}}"
+      annotations:
+        prrte.kubepmix.dev/node: "{{node}}"
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            prrte.kubepmix.dev/managed-by: plm-k8s
+            prrte.kubepmix.dev/dvm: "{{name}}"
+            prrte.kubepmix.dev/rank: "{{rank}}"
+        spec:
+          restartPolicy: Never
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeName: {{node}}
+          containers:
+            - name: prted
+              image: job-runner:latest
+              imagePullPolicy: IfNotPresent
+              command: ["prted"]
+              env:
+                - name: PRTE_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: PRTE_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                {{env}}
+  {{/nodes}}

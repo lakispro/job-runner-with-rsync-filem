@@ -1,0 +1,64 @@
+# -*- text -*-
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# This is the US/English help file for PRTE's filem/rsync component.
+#
+[stage-dir-failed]
+filem/rsync was unable to create or write a directory it needs under the
+session directory:
+
+  Path:  %s
+  Error: %s
+
+Check that the session directory (--prtemca prte_tmpdir_base, or $TMPDIR,
+or /tmp) exists, is writable, and has space.
+#
+[source-missing]
+filem/rsync was asked to pre-position a path that does not exist on the
+node running mpirun/prterun:
+
+  Path:  %s
+  Error: %s
+
+--preload-files paths are resolved on the machine you launched from, and
+relative paths are resolved against its current working directory.
+#
+[stage-failed]
+filem/rsync was unable to stage a pre-positioned path into the tree it
+exports to the daemons:
+
+  Source:      %s
+  Staging dir: %s
+  rsync exit:  %d
+
+rsync's own diagnostics were written to this process's stderr. A common
+cause is a source tree that changed underneath the copy, or a full or
+read-only session directory.
+#
+[pull-failed]
+A PRRTE daemon could not fetch the pre-positioned files from the node
+running mpirun/prterun, so the processes it starts will not see them:
+
+  Daemon node:   %s
+  Job:           %s
+  HNP addresses: %s
+  rsync port:    %u
+
+Every address above was tried in turn. Usually this means none of them is
+reachable from the daemon's node, or the rsync port is blocked between
+them - the daemons connect *back* to the launching host on an ephemeral
+port, which a firewall or a NetworkPolicy may not expect. Pin the port
+with --prtemca filem_rsync_port <n> if you need to open a hole for it,
+and re-run with --prtemca filem_base_verbose 5 to see rsync's own error.
+#
+[workdir-failed]
+filem/rsync delivered the pre-positioned files but could not make them the
+working directory of the job's processes:
+
+  Directory: %s
+  Error:     %s
+
+The processes would have started somewhere else and not found the files, so
+the launch was failed instead. Set --prtemca filem_rsync_set_workdir 0 if you
+would rather keep your own working directory and locate the files yourself.

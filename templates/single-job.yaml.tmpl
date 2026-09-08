@@ -1,0 +1,118 @@
+# plm/k8s default template - ONE Kubernetes object for the whole DVM.
+#
+# A Job with completions/parallelism equal to the number of daemons being
+# launched, so a single pod template covers every node. The two things
+# that shape everything below both come from "single pod template":
+#
+#   * The daemons' vpids cannot be in the env: block, because that block is
+#     shared by all the pods and every daemon needs a different one. So the
+#     env tag at global scope is exactly the common part - every PRTE_MCA /
+#     PMIX_MCA setting *except* ess_base_vpid - and each pod works out its
+#     own, below.
+#
+#   * Which pod lands on which node is the scheduler's call, not ours:
+#     Kubernetes has no way to bind replica i of a Job to node i.
+#
+# The second point is not a detail to wave away. PRRTE's allocation has
+# already decided that daemon 1 is on node A and daemon 2 is on node B, and
+# it maps application processes onto that. If the pods come up the other way
+# round, every daemon reports a hostname PRRTE assigned to a *different*
+# node, and PRRTE's node table ends up with two entries that have swapped
+# names - which does not merely mislocate processes, it corrupts the DVM.
+#
+# So the pod does not assume its placement: it reads the node it actually
+# landed on from the downward API and looks up the vpid PRRTE assigned to
+# *that* node in the node_vpids tag. Placement then does not have to be
+# controlled at all, only constrained - nodeAffinity to the allocated
+# nodes, podAntiAffinity to one daemon per node - and whatever the
+# scheduler decides, PRRTE's map still describes reality.
+#
+# (If you would rather pin explicitly, templates/list-of-jobs.yaml.tmpl
+# renders one nodeName-pinned Job per node instead. It is still one
+# document and one kubectl apply, but N objects.)
+#
+# Placeholders are documented in plm_k8s/plm_k8s_template.h. Keep the
+# prrte.kubepmix.dev/{managed-by,dvm} labels: shutdown cleanup deletes by
+# that selector and finds nothing without them.
+#
+# (The renderer does not parse YAML, so it substitutes tags inside these
+# comments too - which is why the prose above names them without writing
+# them out.)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{name}}
+  labels:
+    prrte.kubepmix.dev/managed-by: plm-k8s
+    prrte.kubepmix.dev/dvm: "{{name}}"
+  annotations:
+    prrte.kubepmix.dev/nodes: "{{nodes_csv}}"
+spec:
+  completions: {{numnodes}}
+  parallelism: {{numnodes}}
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        prrte.kubepmix.dev/managed-by: plm-k8s
+        prrte.kubepmix.dev/dvm: "{{name}}"
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      {{#nodes}}
+                      - "{{node}}"
+                      {{/nodes}}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  prrte.kubepmix.dev/dvm: "{{name}}"
+      containers:
+        - name: prted
+          image: job-runner:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Take the vpid PRRTE assigned to the node we actually landed
+              # on. Failing loudly when it is not in the list matters: a
+              # daemon that guessed would corrupt the DVM's node table
+              # rather than fail, and that is far harder to diagnose.
+              IFS=,
+              for pair in $PRTE_K8S_NODE_VPIDS; do
+                case $pair in
+                  "$PRTE_K8S_NODE":*) PRTE_MCA_ess_base_vpid=${pair#*:} ;;
+                esac
+              done
+              unset IFS
+              if [ -z "$PRTE_MCA_ess_base_vpid" ]; then
+                echo "plm/k8s: this pod landed on '$PRTE_K8S_NODE', which is not" >&2
+                echo "one of the allocated nodes ($PRTE_K8S_NODE_VPIDS) - refusing" >&2
+                echo "to start a daemon with an unknown identity." >&2
+                exit 1
+              fi
+              export PRTE_MCA_ess_base_vpid
+              exec prted
+          env:
+            - name: PRTE_K8S_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PRTE_K8S_NODE_VPIDS
+              value: "{{node_vpids}}"
+            - name: PRTE_ALLOW_RUN_AS_ROOT
+              value: "1"
+            - name: PRTE_ALLOW_RUN_AS_ROOT_CONFIRM
+              value: "1"
+            {{env}}

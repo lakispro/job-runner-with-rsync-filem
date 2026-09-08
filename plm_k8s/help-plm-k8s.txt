@@ -1,0 +1,24 @@
+# -*- text -*-
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# This is the US/English help file for PRTE's plm/k8s component.
+#
+[timeout-less-than-zero]
+The value of the MCA parameter "plm_k8s_apply_timeout" is less than or
+equal to zero (%d). This parameter caps how long "kubectl apply" and
+"kubectl delete" are given to return, so that an unresponsive API server
+cannot hang the DVM's launch or shutdown. It is enforced with alarm(2) in
+the forked kubectl process, not with kubectl's own --request-timeout.
+
+This value has automatically been reset to 120; processing will continue.
+#
+[tmpfile-error]
+plm/k8s was unable to create a temporary file to hold the rendered
+manifest before running "kubectl apply -f" on it:
+
+  Path attempted: %s
+  Error:          %s
+
+Check that the directory named by --prtemca plm_k8s_workdir (or $TMPDIR,
+or /tmp if neither is set) exists and is writable.
