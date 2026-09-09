@@ -291,7 +291,50 @@ static void append_unique_envar(char ***envars, const char *key, const char *val
     }
 }
 
-char **prte_plm_k8s_argv_to_envars(char **argv, const char *skip)
+/* MCA parameters that must never reach a daemon.
+ *
+ * "plm" and everything under "plm_k8s_" are ours and ours alone: this
+ * component never tree-spawns, so no daemon launches anything, and a
+ * prted only opens the plm framework at all if PRTE_MCA_plm is set in its
+ * environment (ess_base_std_prted.c gates it on exactly that, with the
+ * comment "the prted has no need of the proxy PLM at all"). Forwarding
+ * them would make every daemon load a launcher it cannot use, and - worse
+ * - would make *this component* a requirement of the worker image rather
+ * than only the launcher's, which is the opposite of what a k8s launch
+ * should need. The daemon pods should be able to run a stock Open MPI.
+ *
+ * This is not a hypothetical leak: prte_plm_base_prted_append_basic_args()
+ * copies every PRTE_MCA_* / PMIX_MCA_* it finds in *our* environment onto
+ * the daemon command line, so a launcher that selects this component with
+ * "export PRTE_MCA_plm=k8s" - the natural thing to do in a pod spec -
+ * hands it straight to the daemons unless it is filtered here. */
+static bool is_launcher_only_param(const char *name)
+{
+    return (0 == strcmp(name, "plm") || 0 == strncmp(name, "plm_k8s_", 8));
+}
+
+/* True if this "--prtemca <name> <value>" is here only because
+ * prte_plm_base_prted_append_basic_args() found PRTE_MCA_<name>=<value> in
+ * our own environment and copied it onto the command line. That is the
+ * distinction plm_k8s_pass_environ_mca_params is about, and by the time we
+ * see the argv it is the only way left to draw it. */
+static bool came_from_our_environ(const char *prefix, const char *name, const char *value)
+{
+    char *key;
+    const char *ours;
+    bool match;
+
+    pmix_asprintf(&key, "%s%s", prefix, name);
+    if (NULL == key) {
+        return false;
+    }
+    ours = getenv(key);
+    free(key);
+    match = (NULL != ours && 0 == strcmp(ours, value));
+    return match;
+}
+
+char **prte_plm_k8s_argv_to_envars(char **argv, const char *skip, bool pass_environ)
 {
     char **envars = NULL;
     char *key;
@@ -301,21 +344,25 @@ char **prte_plm_k8s_argv_to_envars(char **argv, const char *skip)
         return NULL;
     }
     for (i = 0; NULL != argv[i]; i++) {
+        const char *prefix = NULL;
+
         if (0 == strcmp(argv[i], "--prtemca") && NULL != argv[i + 1] && NULL != argv[i + 2]) {
-            if (NULL == skip || 0 != strcmp(argv[i + 1], skip)) {
-                pmix_asprintf(&key, "PRTE_MCA_%s", argv[i + 1]);
-                if (NULL != key) {
-                    append_unique_envar(&envars, key, argv[i + 2]);
-                    free(key);
-                }
-            }
-            i += 2;
+            prefix = "PRTE_MCA_";
         } else if (0 == strcmp(argv[i], "--pmixmca") && NULL != argv[i + 1]
                    && NULL != argv[i + 2]) {
-            if (NULL == skip || 0 != strcmp(argv[i + 1], skip)) {
-                pmix_asprintf(&key, "PMIX_MCA_%s", argv[i + 1]);
+            prefix = "PMIX_MCA_";
+        }
+
+        if (NULL != prefix) {
+            const char *name = argv[i + 1];
+            const char *value = argv[i + 2];
+
+            if ((NULL == skip || 0 != strcmp(name, skip))
+                && !is_launcher_only_param(name)
+                && (pass_environ || !came_from_our_environ(prefix, name, value))) {
+                pmix_asprintf(&key, "%s%s", prefix, name);
                 if (NULL != key) {
-                    append_unique_envar(&envars, key, argv[i + 2]);
+                    append_unique_envar(&envars, key, value);
                     free(key);
                 }
             }

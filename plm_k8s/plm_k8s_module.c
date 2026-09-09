@@ -302,9 +302,17 @@ static void launch_daemons(int fd, short args, void *cbdata)
      * as ssh does with its own argv template */
     argc = 0;
     prte_plm_base_prted_append_basic_args(&argc, &argv, "env", &proc_vpid_index);
-    pmix_argv_append(&argc, &argv, "--prtemca");
-    pmix_argv_append(&argc, &argv, "plm");
-    pmix_argv_append(&argc, &argv, "k8s");
+    /* Deliberately *not* appending "--prtemca plm k8s" here. A prted only
+     * opens the plm framework at all if PRTE_MCA_plm is set in its
+     * environment - ess_base_std_prted.c gates it on exactly that, with
+     * the comment "the prted has no need of the proxy PLM at all" - and
+     * that is true here too: this component never tree-spawns, so no
+     * daemon ever launches anything. Forwarding it would make every
+     * daemon load and initialise a launcher it cannot use, and would make
+     * this component a requirement of the *worker* image rather than only
+     * the launcher's. Leaving it out is what lets the daemon pods run a
+     * stock Open MPI image.
+     */
 
     tnodes = (prte_plm_k8s_tnode_t *) calloc((size_t) map->num_new_daemons, sizeof(*tnodes));
     if (NULL == tnodes) {
@@ -354,7 +362,8 @@ static void launch_daemons(int fd, short args, void *cbdata)
         tnodes[num_tnodes].node = strdup((NULL != node->rawname) ? node->rawname : node->name);
         tnodes[num_tnodes].rank = strdup(argv[proc_vpid_index]);
         tnodes[num_tnodes].slots = (int) node->slots;
-        tnodes[num_tnodes].envars = prte_plm_k8s_argv_to_envars(argv, NULL);
+        tnodes[num_tnodes].envars = prte_plm_k8s_argv_to_envars(
+            argv, NULL, prte_mca_plm_k8s_component.pass_environ_mca_params);
         if (NULL == tnodes[num_tnodes].node || NULL == tnodes[num_tnodes].rank) {
             rc = PRTE_ERR_OUT_OF_RESOURCE;
             goto cleanup;
@@ -379,7 +388,8 @@ static void launch_daemons(int fd, short args, void *cbdata)
     tctx.nodes = tnodes;
     tctx.num_nodes = num_tnodes;
     tctx.vpid_start = (int) map->daemon_vpid_start;
-    tctx.common_envars = prte_plm_k8s_argv_to_envars(argv, "ess_base_vpid");
+    tctx.common_envars = prte_plm_k8s_argv_to_envars(
+        argv, "ess_base_vpid", prte_mca_plm_k8s_component.pass_environ_mca_params);
 
     manifest = prte_plm_k8s_render(template_text, &tctx);
     PMIx_Argv_free(tctx.common_envars);

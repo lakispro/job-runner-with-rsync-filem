@@ -140,17 +140,26 @@ PRTE_EXPORT char *prte_plm_k8s_sanitize_name(const char *raw, size_t maxlen);
  * lets a bare `prted` (no argv at all) pick up its whole configuration
  * from its container's env: block.
  *
- * If `skip` is non-NULL, an MCA parameter of that name (e.g.
- * "ess_base_vpid") is left out of the result - that is how the common
- * env block gets built out of the same argv as the per-node ones.
+ * Three things are filtered out:
  *
- * A bare flag (e.g. "--debug-daemons") has no such env-var equivalent
- * this component can infer; it is logged at output-verbosity 1 and
- * dropped.
+ *   - an MCA parameter named by `skip` (e.g. "ess_base_vpid") - that is
+ *     how the common env block gets built out of the same argv as the
+ *     per-node ones;
+ *   - always, "plm" and everything under "plm_k8s_": they are the
+ *     launcher's business and forwarding them would make this component a
+ *     requirement of the *worker* image (see is_launcher_only_param());
+ *   - unless `pass_environ`, any parameter that is on the command line
+ *     only because prte_plm_base_prted_append_basic_args() copied it
+ *     there out of our own environment. That is what
+ *     plm_k8s_pass_environ_mca_params selects between.
+ *
+ * A bare flag (e.g. "--debug-daemons") has no env-var equivalent this
+ * component can infer; it is logged at output-verbosity 1 and dropped.
  *
  * Returns a NULL-terminated PMIx_Argv-style array the caller frees with
  * PMIx_Argv_free(), or NULL if `argv` is NULL or empty. */
-PRTE_EXPORT char **prte_plm_k8s_argv_to_envars(char **argv, const char *skip);
+PRTE_EXPORT char **prte_plm_k8s_argv_to_envars(char **argv, const char *skip,
+                                               bool pass_environ);
 
 END_C_DECLS
 

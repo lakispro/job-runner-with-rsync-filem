@@ -89,6 +89,37 @@ unchanged. There is no namespace parameter: put `namespace:` in the
 template's `metadata:`, or point `plm_k8s_kubectl_args` at
 `--context`/`--kubeconfig`.
 
+## What the worker image needs
+
+The daemon pods' image is whatever the template's `image:` says, and it
+does **not** have to be this one:
+
+| | Worker image must contain |
+| --- | --- |
+| `plm/k8s` | **Nothing beyond a compatible stock PRRTE** — `prted`, and `/bin/sh` for the template's four-line vpid lookup. |
+| `filem/rsync` | The component **and** the `rsync` binary. |
+
+`plm/k8s` is launcher-side by construction: `prted`'s whole configuration
+arrives in `env:`, and the component deliberately filters `plm` and every
+`plm_k8s_*` parameter *out* of that env. That filtering is load-bearing,
+not tidiness — `prte_plm_base_prted_append_basic_args()` copies every
+`PRTE_MCA_*` it finds in the launcher's own environment onto the daemon
+command line, so a launcher that selects the component the natural way
+(`PRTE_MCA_plm=k8s` in its pod spec, as `test/launcher.yaml` does) would
+otherwise hand it straight to the daemons and make this component a
+requirement of their image. A `prted` opens the plm framework only if
+`PRTE_MCA_plm` is set, and PRRTE's own comment on that gate is "the prted
+has no need of the proxy PLM at all" — true here, since this component
+never tree-spawns. So the daemons get exactly `ess`, `ess_base_nspace`,
+`ess_base_vpid`, `ess_base_num_procs` and `prte_hnp_uri`, and nothing else.
+
+`filem/rsync` is not launcher-side today: the HNP xcasts "pull from here"
+and each `prted` runs the rsync client itself, so the component has to be
+selected on every daemon. A worker without it fails the launch quickly and
+cleanly rather than hanging — the stock `filem/raw` receives the xcast,
+fails to unpack it, and acks with an error, so the job dies with
+`FILES_POSN_FAILED` — but it does fail. See "Known limitations".
+
 ## `plm/k8s` — one templated object for the whole DVM
 
 ### What changed from one-Job-per-daemon
@@ -474,6 +505,11 @@ generated, not maintained:
   the DVM** if the pods land in a different order than the allocation
   assumed. Use one of the two shipped approaches (node-to-vpid lookup, or
   `nodeName` pinning); see "The default template".
+- **`filem/rsync` needs the component in the worker image**, because the
+  daemons run the rsync client. Making it launcher-only means pushing
+  instead of pulling, which needs *some* cooperation on the far side
+  (`rsync` for `rsync -e`, `tar` for `kubectl cp`) or a sidecar container
+  that has it; `plm/k8s` has no such requirement.
 - **`filem/rsync` pre-positions per job, not per DVM.** A second `prun`
   into the same DVM re-runs the whole exchange; nothing is cached between
   jobs beyond the rsync daemon itself staying up.
