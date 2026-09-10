@@ -1,0 +1,128 @@
+# plm/k8s template: ONE Volcano Job for the whole DVM, on *anonymous*
+# nodes.
+#
+# This is the shape to use when you want to say "give me N nodes" rather
+# than naming them. The allocation you hand PRRTE is N placeholder names
+# - "--host n0,n1,n2,n3", or a hostfile of them - which exist only to tell
+# it how many daemons to start and how many slots each has. Nothing here
+# looks at those names: Volcano places the pods, each prted reports the
+# hostname it actually landed on, and PRRTE renames its placeholder node
+# to that and keeps the placeholder as an alias.
+#
+# That rename is safe *because* the names are synthetic. Renaming is
+# PRRTE's normal handling for "the hostfile said an IP, the daemon says a
+# hostname", and it is only dangerous when the placeholder names are
+# themselves real node names belonging to other node objects - then two
+# entries end up wanting the same name and the DVM corrupts itself. Made-up
+# names cannot collide, so this mode is the safe way to let the scheduler
+# choose. (Do not use real node names here; use single-job.yaml.tmpl for
+# that, which maps node -> vpid explicitly.)
+#
+# Run it with:
+#   mpirun --prtemca plm k8s \
+#          --prtemca plm_k8s_template /opt/job-runner/templates/volcano-job.yaml.tmpl \
+#          --prtemca plm_k8s_assign_nodes 0 \
+#          --host n0:8,n1:8,n2:8,n3:8 -n 32 ./app
+#
+# assign_nodes must be 0: the allocation's node-to-daemon assignment is
+# genuinely not honoured here, and that is the whole point.
+#
+# What Volcano adds over a plain batch/v1 Job is gang scheduling.
+# minAvailable equal to the daemon count means the cluster either places
+# every daemon or none of them - which is what MPI actually needs, since a
+# DVM that comes up three-quarters of the way just sits there waiting for
+# a daemon that will never be scheduled. Requires Volcano installed and
+# `schedulerName: volcano`.
+#
+# (The renderer does not parse YAML, so it substitutes tags inside these
+# comments too - which is why the prose above names them without writing
+# them out.)
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: {{name}}
+  labels:
+    prrte.kubepmix.dev/managed-by: plm-k8s
+    prrte.kubepmix.dev/dvm: "{{name}}"
+spec:
+  # all daemons or none - see above
+  minAvailable: {{numnodes}}
+  schedulerName: volcano
+  queue: default
+  policies:
+    # one daemon dying makes the DVM unusable, so take the whole thing
+    # down rather than leave PRRTE talking to a corpse
+    - event: PodFailed
+      action: TerminateJob
+    - event: PodEvicted
+      action: TerminateJob
+    # NOTE on what gang scheduling does and does not buy you here.
+    # Volcano's gang plugin gates at the *queue*: the enqueue action admits
+    # a PodGroup only when the queue can fit it, and after that allocate
+    # binds pods as nodes come free. With the default, uncapped queue that
+    # means partial startup is possible - measured on a 3-node cluster,
+    # asking for 4 nodes gives 3 Running and 1 Pending, not 0 Running - and
+    # PRRTE 3.0.13 has no DVM-startup timeout, so mpirun then waits for the
+    # missing daemon indefinitely. If that matters, give the queue a real
+    # capacity (or set minResources on the PodGroup) so enqueue can refuse
+    # the job outright instead of half-placing it. There is no PodPending
+    # policy event to fall back on; Volcano accepts only
+    # [PodFailed Unknown TaskCompleted TaskFailed * PodEvicted JobUpdated].
+  tasks:
+    - name: prted
+      replicas: {{numnodes}}
+      template:
+        metadata:
+          labels:
+            prrte.kubepmix.dev/managed-by: plm-k8s
+            prrte.kubepmix.dev/dvm: "{{name}}"
+        spec:
+          restartPolicy: Never
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          affinity:
+            podAntiAffinity:
+              # one daemon per node. Not cosmetic: two daemons on one node
+              # would report the same hostname, and *that* is the name
+              # collision this mode otherwise avoids.
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      prrte.kubepmix.dev/dvm: "{{name}}"
+          containers:
+            - name: prted
+              image: job-runner:latest
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  # Which daemon am I? Volcano (checked on 1.9) injects no
+                  # task-index environment variable at all - the index lives
+                  # only in the pod name, which its controller builds as
+                  # "<job>-<task>-<index>" and which is therefore stable and
+                  # dense, unlike the random suffix a batch/v1 Job appends.
+                  # VC_/VK_TASK_INDEX are tried first in case a release
+                  # brings them back, and JOB_COMPLETION_INDEX so this file
+                  # still works if you drop the Volcano wrapper for a plain
+                  # Indexed Job.
+                  IDX=${VC_TASK_INDEX:-${VK_TASK_INDEX:-${JOB_COMPLETION_INDEX:-${PRTE_K8S_POD##*-}}}}
+                  case $IDX in
+                    ''|*[!0-9]*)
+                      echo "plm/k8s: cannot work out which daemon this pod is." >&2
+                      echo "No task index in the environment, and the pod name" >&2
+                      echo "('$PRTE_K8S_POD') does not end in one." >&2
+                      exit 1 ;;
+                  esac
+                  export PRTE_MCA_ess_base_vpid=$(( IDX + {{vpid_start}} ))
+                  exec prted
+              env:
+                - name: PRTE_K8S_POD
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: PRTE_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: PRTE_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                {{env}}

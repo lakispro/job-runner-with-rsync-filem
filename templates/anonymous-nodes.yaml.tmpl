@@ -1,0 +1,82 @@
+# plm/k8s template: ONE Job for the whole DVM, on *anonymous* nodes.
+#
+# Use this when you want to say "give me N nodes" rather than name them.
+# The allocation you hand PRRTE is N placeholder names - "--host
+# n0,n1,n2,n3", or a hostfile of them - which exist only to say how many
+# daemons to start and how many slots each has. Nothing here looks at
+# those names: Kubernetes places the pods, each prted reports the hostname
+# it actually landed on, and PRRTE renames its placeholder node to that,
+# keeping the placeholder as an alias.
+#
+# That rename is safe *because* the names are synthetic. It is PRRTE's
+# normal handling for "the hostfile said an IP, the daemon says a
+# hostname", and it is only dangerous when the placeholders are themselves
+# real node names belonging to other node objects - then two entries end
+# up wanting the same name and the DVM corrupts itself. Made-up names
+# cannot collide. Do not put real node names here; use
+# single-job.yaml.tmpl for that, which maps node to vpid explicitly.
+#
+#   mpirun --prtemca plm k8s \
+#          --prtemca plm_k8s_template /opt/job-runner/templates/anonymous-nodes.yaml.tmpl \
+#          --prtemca plm_k8s_assign_nodes 0 \
+#          --host n0:8,n1:8,n2:8,n3:8 -n 32 --preload-files "$(pwd)" ./app
+#
+# assign_nodes must be 0: the allocation's node-to-daemon assignment is
+# genuinely not honoured here, and that is the point.
+#
+# See volcano-job.yaml.tmpl for the same idea as a Volcano Job, which adds
+# gang scheduling.
+#
+# (The renderer does not parse YAML, so it substitutes tags inside these
+# comments too - which is why the prose above names them without writing
+# them out.)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{name}}
+  labels:
+    prrte.kubepmix.dev/managed-by: plm-k8s
+    prrte.kubepmix.dev/dvm: "{{name}}"
+spec:
+  # Indexed, so JOB_COMPLETION_INDEX gives each pod a dense 0..N-1 number
+  # to derive its vpid from. Which index lands on which node is the
+  # scheduler's business and does not matter here.
+  completionMode: Indexed
+  completions: {{numnodes}}
+  parallelism: {{numnodes}}
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        prrte.kubepmix.dev/managed-by: plm-k8s
+        prrte.kubepmix.dev/dvm: "{{name}}"
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        podAntiAffinity:
+          # One daemon per node. Not cosmetic: two daemons on one node
+          # would report the same hostname, which is exactly the name
+          # collision this mode otherwise cannot have.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  prrte.kubepmix.dev/dvm: "{{name}}"
+      containers:
+        - name: prted
+          image: job-runner:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export PRTE_MCA_ess_base_vpid=$(( ${JOB_COMPLETION_INDEX} + {{vpid_start}} ))
+              exec prted
+          env:
+            - name: PRTE_ALLOW_RUN_AS_ROOT
+              value: "1"
+            - name: PRTE_ALLOW_RUN_AS_ROOT_CONFIRM
+              value: "1"
+            {{env}}

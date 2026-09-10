@@ -167,6 +167,24 @@ static int k8s_component_register(void)
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_plm_k8s_component.assign_nodes);
 
+    /* A string literal, never reassigned. "job,pod" covers both shipped
+     * templates - the single batch/v1 Job, and the per-node Jobs a
+     * "kind: List" expands to - and pods on their own in case a template
+     * creates those directly. A template that creates a custom resource
+     * must extend this: "kubectl delete" resolves "job" to batch/v1 and
+     * will happily report success while leaving a
+     * jobs.batch.volcano.sh behind. */
+    prte_mca_plm_k8s_component.cleanup_kinds = "job,pod";
+    (void) pmix_mca_base_component_var_register(c, "cleanup_kinds",
+                                                "Comma-separated resource kinds that shutdown "
+                                                "cleanup deletes by label selector. Extend this "
+                                                "when the template creates something else, e.g. "
+                                                "\"jobs.batch.volcano.sh,pod\" for the Volcano "
+                                                "template - the component cannot know what a "
+                                                "template made",
+                                                PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                                &prte_mca_plm_k8s_component.cleanup_kinds);
+
     prte_mca_plm_k8s_component.apply_timeout = 120;
     (void) pmix_mca_base_component_var_register(c, "apply_timeout",
                                                 "Seconds to wait for \"kubectl apply\" or "

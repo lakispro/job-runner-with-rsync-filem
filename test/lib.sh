@@ -46,9 +46,11 @@ check_line() {
 }
 
 # check_count <description> <expected-count> <substring> <actual-output>
+# Counts *occurrences*, not matching lines: "ls" columnises when it feels
+# like it, so two hits can share a line and "grep -c" would report one.
 check_count() {
     local desc=$1 want=$2 needle=$3 haystack=$4 got
-    got=$(grep -cF -- "$needle" <<<"$haystack" || true)
+    got=$(grep -oF -- "$needle" <<<"$haystack" | grep -c . || true)
     if [ "$got" = "$want" ]; then
         ok "$desc"
     else
@@ -101,6 +103,9 @@ ensure_launcher() {
     kube apply -f "$REPO_ROOT/test/launcher.yaml" >/dev/null
     kube wait --for=condition=Ready "pod/$LAUNCHER" --timeout=180s >/dev/null || return 1
     kube cp "$REPO_ROOT/test/fixtures/." "$LAUNCHER:/work/"
+    # Build the MPI test program in the launcher. It only exists there,
+    # which is the point: getting it onto the workers is filem/rsync's job.
+    kube exec "$LAUNCHER" -- bash -lc 'cd /work && mpicc -o mpi_hello mpi_hello.c' || return 1
     info "fixtures in /work: $(kube exec "$LAUNCHER" -- ls /work | tr '\n' ' ')"
 }
 

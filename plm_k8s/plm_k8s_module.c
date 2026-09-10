@@ -73,18 +73,14 @@
 #include "plm_k8s.h"
 #include "plm_k8s_template.h"
 
-/* The kinds shutdown cleanup deletes, and the label selector it deletes
- * by. Both must keep matching what the templates stamp: the selector is
- * on every object either shipped template creates, and the kind list
- * covers both shapes (the single Indexed Job, and the per-node Jobs a
- * "kind: List" template expands to). "kubectl delete <kinds> -l ..."
- * silently finds nothing for a kind a template never created, so listing
- * a kind costs nothing but one API call.
+/* The label selector shutdown cleanup deletes by. It must keep matching
+ * what the templates stamp - every object all three shipped templates
+ * create carries these two labels. Which *kinds* to delete is the
+ * plm_k8s_cleanup_kinds MCA parameter, because the component cannot know
+ * what a template made: "kubectl delete job" resolves to batch/v1 and
+ * will report success while leaving a jobs.batch.volcano.sh behind.
  *
- * If you template something else - a JobSet, a LeaderWorkerSet - add its
- * kind here, or cleanup will leave it behind. Cleanup is not a toggle:
- * it always runs. */
-#define PRTE_PLM_K8S_CLEANUP_KINDS "job,pod"
+ * Cleanup itself is not a toggle: it always runs. */
 #define PRTE_PLM_K8S_CLEANUP_SELECTOR \
     "prrte.kubepmix.dev/managed-by=plm-k8s,prrte.kubepmix.dev/dvm=%s"
 
@@ -144,6 +140,22 @@ static int write_manifest_to_tmpfile(const char *manifest, char **path_out);
 static char *get_base_name(void);
 static void delete_applied_objects(void);
 static int apply_manifest(prte_plm_k8s_caddy_t *caddy);
+static char **build_cleanup_argv(void);
+
+/* The complete "kubectl delete ..." argv, built once during init and kept
+ * until teardown.
+ *
+ * It deliberately is not built at the point it is used. The MCA variable
+ * system deregisters and frees a component's string parameters during
+ * framework close, and framework close is what *calls* our finalize
+ * (prte_plm_base_close -> k8s_finalize), so by then cleanup_kinds,
+ * kubectl_args and name_prefix are all NULL. Reading them there
+ * segfaults on the first one that is not NULL-checked and silently drops
+ * the value of the ones that are - so a DVM using plm_k8s_name_prefix
+ * would compute a different label selector at teardown than it did at
+ * launch, and quietly delete nothing. Snapshotting the finished argv
+ * while the parameters are still alive avoids all of it. */
+static char **cleanup_argv = NULL;
 
 /**
  * Init the module
@@ -170,6 +182,10 @@ static int k8s_init(void)
      * that does neither costs you. */
     prte_plm_globals.daemon_nodes_assigned_at_launch
         = prte_mca_plm_k8s_component.assign_nodes;
+
+    /* while the MCA parameters it is made of are still alive - see the
+     * comment on cleanup_argv */
+    cleanup_argv = build_cleanup_argv();
 
     return rc;
 }
@@ -785,48 +801,51 @@ static void run_kubectl_sync(char **argv)
  * A template that dropped the "prrte.kubepmix.dev/*" labels simply leaves
  * nothing for this selector to find, which is a silent no-op rather than
  * an error. Not an MCA-configurable toggle - this always runs. */
-static void delete_applied_objects(void)
+static char **build_cleanup_argv(void)
 {
     char *base_name, *selector;
     int argc;
     char **argv;
 
-    /* HNP only. Every prted also runs this component - we forward
-     * PRTE_MCA_plm=k8s into their environment so they have a plm module
-     * like any other daemon - and each of them reaching finalize would
-     * otherwise fire its own "kubectl delete" at the objects it is itself
-     * running in. In a cluster that is at best a flurry of "Forbidden"
-     * from a daemon service account that has no business deleting Jobs,
-     * and at worst a daemon tearing the DVM down from underneath itself. */
-    if (!PRTE_PROC_IS_MASTER) {
-        return;
-    }
-
     base_name = get_base_name();
     if (NULL == base_name) {
-        return;
+        return NULL;
     }
     pmix_asprintf(&selector, PRTE_PLM_K8S_CLEANUP_SELECTOR, base_name);
     free(base_name);
     if (NULL == selector) {
-        return;
+        return NULL;
     }
 
     argv = build_kubectl_argv("delete");
     argc = PMIx_Argv_count(argv);
-    pmix_argv_append(&argc, &argv, PRTE_PLM_K8S_CLEANUP_KINDS);
+    pmix_argv_append(&argc, &argv, prte_mca_plm_k8s_component.cleanup_kinds);
     pmix_argv_append(&argc, &argv, "-l");
     pmix_argv_append(&argc, &argv, selector);
     pmix_argv_append(&argc, &argv, "--all-namespaces");
     pmix_argv_append(&argc, &argv, "--ignore-not-found");
     pmix_argv_append(&argc, &argv, "--wait=false");
+    free(selector);
+
+    return argv;
+}
+
+static void delete_applied_objects(void)
+{
+    /* HNP only. If a template ever gives the daemons this component too,
+     * each of them reaching teardown would otherwise fire its own
+     * "kubectl delete" at the objects it is itself running in: at best a
+     * flurry of "Forbidden" from a daemon service account that has no
+     * business deleting Jobs, at worst a daemon tearing the DVM down from
+     * underneath itself. */
+    if (!PRTE_PROC_IS_MASTER || NULL == cleanup_argv) {
+        return;
+    }
 
     PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                         "%s plm:k8s: deleting this DVM's objects (selector \"%s\")",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), selector));
-    free(selector);
-    run_kubectl_sync(argv);
-    PMIx_Argv_free(argv);
+                         "%s plm:k8s: deleting this DVM's objects: %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cleanup_argv[1]));
+    run_kubectl_sync(cleanup_argv);
 }
 
 static int k8s_finalize(void)
@@ -842,6 +861,8 @@ static int k8s_finalize(void)
         delete_applied_objects();
     }
 
+    PMIx_Argv_free(cleanup_argv);
+    cleanup_argv = NULL;
     free(prte_mca_plm_k8s_component.kubectl_path);
     prte_mca_plm_k8s_component.kubectl_path = NULL;
 

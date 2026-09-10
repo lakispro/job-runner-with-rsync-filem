@@ -33,8 +33,10 @@ plm_k8s/                    the PLM component (staged into a PRRTE tree at
                               src/mca/plm/k8s/ - see the Dockerfile)
 filem_rsync/                the FILEM component (likewise, src/mca/filem/rsync/)
 templates/
-  single-job.yaml.tmpl      default: one Job covering every node
-  list-of-jobs.yaml.tmpl    alternative: nodeName-pinned Jobs in one document
+  single-job.yaml.tmpl      default: one Job covering every *named* node
+  anonymous-nodes.yaml.tmpl "give me N nodes" - one Job, k8s picks which
+  volcano-job.yaml.tmpl     the same, as one gang-scheduled Volcano Job
+  list-of-jobs.yaml.tmpl    nodeName-pinned Jobs in one document
 contrib/
   embed-default-template.py regenerates the built-in copy of the default
 test/                       the k3d and ssh test rigs (see Testing)
@@ -191,6 +193,69 @@ because PRRTE's MCA system treats `--prtemca X Y` and `PRTE_MCA_X=Y` as
 interchangeable, which is what lets the container command end in a bare
 `exec prted`.)
 
+### Naming nodes, or just asking for N of them
+
+The default template needs an allocation of **real** node names, because
+it maps each one to a vpid. PRRTE has no `ras/k8s`, so that list only ever
+comes from you — `--host`, `--hostfile`, or an RM. `mpirun -n 100` with no
+allocation does not spread across the cluster; it oversubscribes the
+launcher pod and creates zero Kubernetes objects.
+
+Often you do not care *which* nodes. For that,
+`templates/anonymous-nodes.yaml.tmpl` (and `volcano-job.yaml.tmpl`) take
+the other approach: hand PRRTE **placeholder** names that carry only the
+node count and the slots per node, and let the scheduler place the pods.
+
+```sh
+mpirun --prtemca plm_k8s_template /opt/job-runner/templates/anonymous-nodes.yaml.tmpl \
+       --prtemca plm_k8s_assign_nodes 0 \
+       --host n0:8,n1:8,n2:8,n3:8 -n 32 --preload-files "$(pwd)" ./app
+```
+
+Nothing in those templates looks at `n0`…`n3`. Each `prted` reports the
+hostname it actually landed on, and PRRTE renames its placeholder node to
+that, keeping the placeholder as an alias.
+
+**Why that rename is safe here and not in general.** It is PRRTE's normal
+handling for "the hostfile said an IP, the daemon says a hostname". It
+becomes dangerous only when the placeholder names are *themselves real
+node names belonging to other node objects* — then two entries end up
+wanting the same name and the DVM corrupts itself, which is the failure
+described above. Synthetic names cannot collide, so this is the safe way
+to let the scheduler choose. The corollary is the `podAntiAffinity` in
+those templates: two daemons on one node would report the same hostname,
+which is exactly the collision the mode otherwise cannot have.
+
+`plm_k8s_assign_nodes` must be `0` in this mode — the allocation's
+node-to-daemon assignment genuinely is not honoured, and that is the
+point.
+
+### Volcano, and what gang scheduling actually buys you
+
+`templates/volcano-job.yaml.tmpl` is the same idea as one
+`batch.volcano.sh/v1alpha1` `Job` with `minAvailable: {{numnodes}}`.
+
+Two things are worth knowing before you rely on it. Volcano injects **no
+task-index environment variable** (checked on 1.9) — the index lives only
+in the pod name, which its controller builds as `<job>-<task>-<index>`,
+so the template reads it from `metadata.name` via the downward API rather
+than from `JOB_COMPLETION_INDEX`.
+
+And gang scheduling gates at the **queue**, not per pod. The `enqueue`
+action admits a PodGroup when the queue can fit it; after that `allocate`
+binds pods as nodes free up. With the default uncapped queue, partial
+startup is possible — measured on a 3-node cluster, asking for 4 nodes
+gives **3 Running and 1 Pending**, not 0 Running. Since PRRTE 3.0.13 has
+no DVM-startup timeout, `mpirun` then waits for the missing daemon
+indefinitely. If that matters, give the queue a real capacity (or set
+`minResources` on the PodGroup) so `enqueue` refuses the job outright.
+There is no `PodPending` policy event to fall back on; Volcano accepts
+only `[PodFailed Unknown TaskCompleted TaskFailed * PodEvicted
+JobUpdated]`.
+
+Cleanup needs telling about the custom resource:
+`--prtemca plm_k8s_cleanup_kinds jobs.batch.volcano.sh,pod`. See below.
+
 ### The other shipped template: pinned per-node Jobs
 
 `templates/list-of-jobs.yaml.tmpl` renders a `kind: List` whose items are
@@ -269,11 +334,27 @@ template that drops them leaves cleanup finding nothing, silently.
 | `plm_k8s_workdir`                 | `$TMPDIR` or `/tmp`   | Where the rendered manifest is staged |
 | `plm_k8s_assign_nodes`            | `true`                | Whether the template honours the allocation's node-to-daemon assignment — both shipped ones do. Only set `false` for a template that leaves daemon identity to the scheduler |
 | `plm_k8s_apply_timeout`           | `120`                 | Seconds before `kubectl` is given up on (enforced with `alarm(2)`, see below) |
+| `plm_k8s_cleanup_kinds`           | `job,pod`             | Resource kinds shutdown cleanup deletes by label. Extend it when the template creates a custom resource — `kubectl delete job` resolves to `batch/v1` and will report success while leaving a `jobs.batch.volcano.sh` behind |
 | `plm_k8s_pass_environ_mca_params` | `false`               | Forward `PRTE_MCA_*`/`PMIX_MCA_*` found in our own env |
 
 Selection priority is fixed at 5 — below `plm/ssh`'s 10, so a machine that
 has both `ssh` and `kubectl` is not launched into Kubernetes by accident.
 Ask for it explicitly with `--prtemca plm k8s`.
+
+### Cleanup runs after its own configuration is freed
+
+`k8s_finalize()` is called *by* framework close (`prte_plm_base_close` →
+`k8s_finalize`), and the MCA variable system deregisters and frees a
+component's string parameters during that same close. So by the time
+teardown cleanup runs, `cleanup_kinds`, `kubectl_args` and `name_prefix`
+are all NULL — reading one segfaults, and the NULL-checked ones silently
+lose their values, which would make a DVM using `plm_k8s_name_prefix`
+compute a *different* label selector at teardown than at launch and
+quietly delete nothing.
+
+The whole `kubectl delete` argv is therefore built once during
+`k8s_init()`, while those parameters are still alive, and kept until it is
+needed.
 
 ### Two things kubectl taught us
 
@@ -423,6 +504,8 @@ Everything is tested in containers; nothing is built or run on the host.
 ```sh
 test/run-k8s-tests.sh --build     # both goals, against a k3d cluster
 test/run-filem-ssh.sh --build     # filem/rsync alone, over plm/ssh
+test/run-volcano-test.sh          # anonymous nodes on a Volcano Job
+                                  #   (skips if Volcano is not installed)
 ```
 
 `run-k8s-tests.sh` creates a k3d cluster (`--agents 2`), imports the image
@@ -441,6 +524,12 @@ asserts:
   that the node-to-vpid lookup is doing its job, since the two nodes swap
   names in PRRTE's table if it is not;
 - that the alternative `nodeName`-pinned template also launches;
+- **a real MPI program**, not just `ls`/`hostname`: `mpi_hello.c` does an
+  `MPI_Allreduce` whose answer is only right if every rank really ended up
+  in the same communicator, and it exists solely on the launcher, so
+  `filem/rsync` has to deliver it before it can run at all;
+- the anonymous-node mode: that a placeholder host name never survives
+  into the output, and that the job really spanned more than one node;
 - and finally the two commands as typed, with no `--prtemca` at all,
   relying on the launcher pod's `PRTE_MCA_plm=k8s`.
 

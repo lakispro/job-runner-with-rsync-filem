@@ -80,6 +80,11 @@ struct prte_mca_plm_k8s_component_t {
 
     /* seconds to wait for "kubectl apply" to finish before giving up */
     int apply_timeout;
+
+    /* comma-separated resource kinds shutdown cleanup deletes by label -
+     * a template that creates something else (a Volcano Job, a JobSet)
+     * has to say so here, since the component cannot know */
+    char *cleanup_kinds;
 };
 typedef struct prte_mca_plm_k8s_component_t prte_mca_plm_k8s_component_t;
 

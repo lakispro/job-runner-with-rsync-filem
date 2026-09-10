@@ -68,12 +68,18 @@ check_count "script.sh listed on both nodes"  2 "script.sh" "$out"
 check_count "subdir listed on both nodes"     2 "subdir"    "$out"
 
 say "GOAL 1b: 'as-is' - ls shows the preloaded entries and nothing else"
+# Compare against what is actually in the launcher's working directory
+# rather than a hardcoded list, so adding a fixture cannot silently make
+# this assertion weaker (or, as it did once, spuriously fail).
+want=$(launch "ls" | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
 raw=$(launch "mpirun --prtemca plm k8s --host ${NODES[0]} --preload-files \$(pwd) -n 1 ls")
 got=$(tr -s '[:space:]' '\n' <<<"$raw" | grep -v '^$' | sort -u | tr '\n' ' ')
-if [ "$got" = "hello.txt script.sh subdir " ]; then
+if [ "$got" = "$want" ]; then
     ok "ls output is exactly the launching directory's contents"
 else
-    bad "ls showed something other than the preloaded contents: $got"
+    bad "ls showed something other than the preloaded contents"
+    info "wanted: $want"
+    info "got:    $got"
     dump "$raw"
 fi
 
@@ -179,6 +185,50 @@ out=$(launch "mpirun --prtemca plm k8s \
 for n in "${NODES[@]}"; do
     check_line "list-of-jobs template ran a process on $n" "$n" "$out"
 done
+
+###########################################################################
+say "GOAL 3: real MPI, not just hostname"
+###########################################################################
+# ls and hostname prove processes started. This proves they found each
+# other: MPI_Allreduce only returns the right sum if every rank is really
+# in the same communicator, which means PMIx wire-up across the daemons
+# worked. mpi_hello exists only on the launcher, so filem/rsync has to
+# deliver it too.
+# :2 on each host - "--host a,b" alone is one slot per node, and asking
+# for 4 ranks against 2 slots is a legitimate PRRTE refusal, not a bug.
+SLOTTED="${NODES[0]}:2,${NODES[1]}:2"
+out=$(launch "mpirun --host $SLOTTED --preload-files \$(pwd) -n 4 ./mpi_hello")
+check "the collective returned the right answer" "allreduce OK" "$out"
+check_count "all 4 ranks reported in" 4 "/4 on " "$out"
+
+out=$(launch "mpirun --host $SLOTTED --preload-binary -n 2 ./mpi_hello")
+check "--preload-binary also delivers a runnable MPI program" "allreduce OK" "$out"
+
+###########################################################################
+say "GOAL 4: anonymous nodes - ask for N, let Kubernetes choose which"
+###########################################################################
+# Placeholder host names carry only the node *count* and slot counts. The
+# scheduler places the pods, each prted reports the node it really landed
+# on, and PRRTE renames its placeholder to that. The assertion that
+# matters is that no placeholder name survives into the output - if one
+# did, a daemon would be claiming to be somewhere it is not.
+ANON=/opt/job-runner/templates/anonymous-nodes.yaml.tmpl
+out=$(launch "mpirun --prtemca plm_k8s_template $ANON --prtemca plm_k8s_assign_nodes 0 \
+        --host jr-anon-0:2,jr-anon-1:2 --preload-files \$(pwd) -n 3 ./mpi_hello")
+check "anonymous allocation runs a real MPI job" "allreduce OK" "$out"
+if grep -q "jr-anon-" <<<"$out"; then
+    bad "a placeholder host name leaked into the run - the rename did not happen"
+    dump "$out"
+else
+    ok "placeholder names were replaced by the real nodes"
+fi
+real=$(grep -oE 'on [^ ]+$' <<<"$out" | sort -u | grep -c .)
+if [ "$real" -ge 2 ]; then
+    ok "the job really spanned $real nodes chosen by Kubernetes"
+else
+    bad "expected the job to span at least 2 nodes, saw $real"
+    dump "$out"
+fi
 
 ###########################################################################
 say "Both together: the user's commands, verbatim"

@@ -82,11 +82,16 @@ out=$(head mpirun --host worker1,worker2 --preload-files /work --pernode ls 2>&1
 check_count "preloading works with no --prtemca filem at all" 2 "hello.txt" "$out"
 
 say "\"as-is\": ls shows the preloaded entries and nothing else"
+# Expected list comes from the launching directory itself, so adding a
+# fixture cannot silently weaken this assertion (or spuriously fail it).
+want=$(head ls /work 2>&1 | tr -s '[:space:]' '\n' | sort -u | grep -v '^$')
 out=$(head mpirun --host worker1 --preload-files /work -n 1 ls 2>&1 | tr -s '[:space:]' '\n' | sort -u | grep -v '^$')
-if [ "$out" = "$(printf 'hello.txt\nscript.sh\nsubdir')" ]; then
+if [ "$out" = "$want" ]; then
     ok "ls output is exactly the preloaded directory's contents"
 else
-    bad "ls showed something other than the preloaded contents: $(tr '\n' ' ' <<<"$out")"
+    bad "ls showed something other than the preloaded contents"
+    info "wanted: $(tr '\n' ' ' <<<"$want")"
+    info "got:    $(tr '\n' ' ' <<<"$out")"
 fi
 
 # NOTE: the stock filem/raw cannot be asked to deliver --preload-files at
